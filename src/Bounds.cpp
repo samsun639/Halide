@@ -23,6 +23,7 @@ using std::map;
 using std::vector;
 using std::string;
 using std::pair;
+using std::set;
 
 namespace {
 int static_sign(Expr x) {
@@ -1046,6 +1047,25 @@ bool box_contains(const Box &outer, const Box &inner) {
     return is_one(simplify(condition));
 }
 
+// Collect all variables referenced in an expr or statement
+// (excluding 'skipped_var')
+class CollectVars : public IRGraphVisitor {
+public:
+    string skipped_var;
+    set<string> vars;
+
+    CollectVars(const string &v) : skipped_var(v) {}
+
+private:
+    using IRGraphVisitor::visit;
+
+    void visit(const Variable *op) {
+        if (op->name != skipped_var) {
+            vars.insert(op->name);
+        }
+    }
+};
+
 // Compute the box produced by a statement
 class BoxesTouched : public IRGraphVisitor {
 
@@ -1063,6 +1083,8 @@ private:
     bool consider_calls, consider_provides;
     Scope<Interval> scope;
     const FuncValueBounds &func_bounds;
+    Scope<Expr> let_stmts;
+    map<string, set<string>> children; // All vars which values depend on var in 'key'
 
     using IRGraphVisitor::visit;
 
@@ -1174,7 +1196,96 @@ private:
     }
 
     void visit(const LetStmt *op) {
+        CollectVars collect(op->name);
+        op->value.accept(&collect);
+        for (const auto &v : collect.vars) {
+            children[v].insert(op->name);
+        }
+        let_stmts.push(op->name, op->value);
+
         visit_let(op);
+
+        let_stmts.pop(op->name);
+        for (const auto &v : collect.vars) {
+            children[v].erase(op->name);
+        }
+    }
+
+    struct LetBound {
+        string var, min_name, max_name;
+        Expr min_value, max_value;
+        LetBound(const string &v, const string &min, const string &max,
+                 const Expr &min_val, const Expr &max_val)
+            : var(v), min_name(min), max_name(max), min_value(min_val), max_value(max_val) {}
+    };
+
+    vector<LetBound> trim_scope_push(const string &name, const Interval &bound) {
+        scope.push(name, bound);
+
+        vector<LetBound> let_bounds;
+        for (const auto &v : children[name]) {
+            internal_assert(scope.contains(v))
+                << "Scope does not contain " << v << ", which is children of " << name << "\n";
+            internal_assert(let_stmts.contains(v));
+
+            Expr val = let_stmts.get(v);
+            Interval v_bound = bounds_of_expr_in_scope(val, scope, func_bounds);
+            bool fixed = v_bound.min.same_as(v_bound.max);
+            v_bound.min = simplify(v_bound.min);
+            v_bound.max = fixed ? v_bound.min : simplify(v_bound.max);
+
+            string max_name = unique_name('t');
+            string min_name = unique_name('t');
+            let_bounds.push_back(LetBound(v, min_name, max_name, v_bound.min, v_bound.max));
+
+            scope.push(v, Interval(Variable::make(val.type(), min_name),
+                                   Variable::make(val.type(), max_name)));
+
+            debug(0) << "\nExpr " << v << " -> " << let_stmts.get(v) << "\n";
+            debug(0) << "\tOld bound min: " << scope.get(v).min << ", max: " << scope.get(v).max << "\n";
+            debug(0) << "\tNew bound min (" << min_name << ") : " << v_bound.min
+                     << ", max (" << max_name << "): " << v_bound.max << "\n";
+        }
+        return let_bounds;
+    }
+
+    void trim_scope_pop(const string &name, const vector<LetBound> &let_bounds) {
+        scope.pop(name);
+        for (const auto &v : children[name]) {
+            scope.pop(v);
+        }
+
+        debug(0) << "\nPop " << name << "\n";
+        for (const auto &l : let_bounds) {
+            debug(0) << "\tmin: " << l.min_name << ", val: " << l.min_value << "\n";
+            debug(0) << "\tmax: " << l.max_name << ", val: " << l.max_value << "\n";
+            for (pair<const string, Box> &i : boxes) {
+                Box &box = i.second;
+                for (size_t i = 0; i < box.size(); i++) {
+                    if (box[i].has_lower_bound()) {
+                        if (expr_uses_var(box[i].min, l.max_name)) {
+                            debug(0) << "\tWrap LOWER trimmed let var: " << l.var << ", max name: " << l.max_name << ", val: " << l.max_value << "\n";
+                            box[i].min = Let::make(l.max_name, l.max_value, box[i].min);
+                        }
+                        if (expr_uses_var(box[i].min, l.min_name)) {
+                            debug(0) << "\tWrap LOWER trimmed let var: " << l.var << ", min name: " << l.min_name << ", val: " << l.min_value << "\n";
+                            box[i].min = Let::make(l.min_name, l.min_value, box[i].min);
+                        }
+                    }
+                    if (box[i].has_upper_bound()) {
+                        if (expr_uses_var(box[i].max, l.max_name)) {
+                            debug(0) << "\tWrap UPPER trimmed let var: " << l.var << ", max name: " << l.max_name << ", val: " << l.max_value << "\n";
+                            box[i].max = Let::make(l.max_name, l.max_value, box[i].max);
+                        }
+                        if (expr_uses_var(box[i].max, l.min_name)) {
+                            debug(0) << "\tWrap UPPER trimmed let var: " << l.var << ", min name: " << l.min_name << ", val: " << l.min_value << "\n";
+                            box[i].max = Let::make(l.min_name, l.min_value, box[i].max);
+                        }
+                    }
+                }
+            }
+        }
+        debug(0) << "\n";
     }
 
     void visit(const IfThenElse *op) {
@@ -1205,6 +1316,7 @@ private:
                 const Variable *var_b = b.as<Variable>();
 
                 string var_to_pop;
+                vector<LetBound> let_bounds;
                 if (a.defined() && b.defined() && a.type() == Int(32)) {
                     Expr inner_min, inner_max;
                     if (var_a && scope.contains(var_a->name)) {
@@ -1241,7 +1353,7 @@ private:
                                 i.min = max(likely_i.min, bi.min);
                             }
                         }
-                        scope.push(var_a->name, i);
+                        let_bounds = trim_scope_push(var_a->name, i);
                         var_to_pop = var_a->name;
                     } else if (var_b && scope.contains(var_b->name)) {
                         Interval i = scope.get(var_b->name);
@@ -1272,13 +1384,13 @@ private:
                                 i.min = max(likely_i.min, ai.min);
                             }
                         }
-                        scope.push(var_b->name, i);
+                        let_bounds = trim_scope_push(var_b->name, i);
                         var_to_pop = var_b->name;
                     }
                 }
                 op->then_case.accept(this);
                 if (!var_to_pop.empty()) {
-                    scope.pop(var_to_pop);
+                    trim_scope_pop(var_to_pop, let_bounds);
                 }
             } else {
                 // Just take the union over the branches
